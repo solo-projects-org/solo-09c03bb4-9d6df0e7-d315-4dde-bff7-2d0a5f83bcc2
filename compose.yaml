@@ -1,0 +1,77 @@
+name: quake-mirror
+
+services:
+  db:
+    build: ./db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: quakes
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=6
+      - -c
+      - max_replication_slots=6
+      - -c
+      - wal_keep_size=256MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quakes"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - back
+
+  app:
+    build: ./app
+    restart: unless-stopped          # 崩溃演示后由 Compose 自动拉起
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: quakes
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      SLOT_NAME: quake_mirror
+      MIRROR_DB: /data/mirror.db
+      LOAD_BATCH: "500"              # 初始装载每批行数
+      LOAD_SLEEP_MS: "120"           # 每批之间的停顿，放大“装载中修订”的演示窗口；生产可设 0
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - appdata:/data                # 镜像与续采位置随卷持久保存
+    ports:
+      - "8000:8000"
+    networks:
+      - back
+
+  simulator:
+    build: ./simulator
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: quakes
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      TICK_MS: "900"                 # 源库扰动节奏：新增/更正/删除
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - back
+
+volumes:
+  pgdata:
+  appdata:
+
+networks:
+  back:
