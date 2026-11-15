@@ -48,7 +48,10 @@ docker compose up --build
 | 每笔源事务整笔可见 | wal2json `format-version 1`：一条消息=一笔源事务；其全部行变更在**同一个 SQLite 事务**里提交 |
 | 镜像与续采位置持久保存后才确认 | 行变更与 `meta.last_applied_lsn` 同事务提交（WAL + `synchronous=FULL`），**提交后**才 `send_feedback` |
 | 写入失败不前移 | 失败/崩溃则不确认；源库重发；镜像端 upsert/delete 幂等重放 |
-| 重启后已建镜像续采 | 状态 `done` 持久在 SQLite：重启后直接从槽位已确认位置续采，不重新装载 |
+| 重送事务不回退目录 | LSN 守卫：消息 LSN 不超过已保存位置即跳过应用、仅补确认，旧值永不盖回新值 |
+| 同名换槽断档不供旧值 | done 续采前用 `last_applied_lsn` 核验槽位 `confirmed_flush_lsn/restart_lsn`；越界即判定断档，置 `serving_hold` 停供并自动重建 |
+| 重建失败/再次重启不发布半成品 | `loading` 状态与停供闩锁随 SQLite 持久化，未追平前查询/CSV 一律 503 |
+| 重启后已建镜像续采 | 状态 `done` 且连续性证明通过：直接从槽位已确认位置续采，不重新装载 |
 | 未建完则重做且不供数 | 重启时状态为 `loading/catchup`：丢弃半成品重新建立；就绪前查询/CSV 一律 503 |
 | 每次取数只读同一已提交状态 | 每个网页请求只开一个 SQLite 只读事务，计数、取页、整个 CSV 流都在同一快照里 |
 | 只处理行变更 | 仅应用 insert/update/delete；truncate 等记录并忽略 |
@@ -107,8 +110,34 @@ app 重启后发现状态是 `loading`（未建完），自动丢弃半成品重
 docker compose restart app
 ```
 
-事件日志显示“镜像已就绪，从复制槽的已确认位置续采”——**不重新装载**，
+事件日志显示“连续性证明通过……从复制槽的已确认位置续采”——**不重新装载**，
 直接从上次确认位置继续，重启期间的源库变更全部补齐。
+
+### 6. 同名换槽断档（停机期间槽被删后同名重建）
+
+故障现场：应用停机时，源库把 `EQH-000001` 震级从 3.0 改成 8.8，随后复制槽被
+删除、又用**同一个槽名**重建。新槽从源库当前 WAL 起算，永远不会投递这笔 8.8；
+若只凭“槽名还在”就续采，应用会一边显示“已就绪”，一边持续供应停机前的旧值 3.0。
+
+一键复现（状态「已就绪」时点按钮，或直接调接口）：
+
+```bash
+curl -X POST http://localhost:8000/demo/slot-reset
+# 等价于源库侧：UPDATE ... magnitude=8.8; 删槽; CREATE_REPLICATION_SLOT 同名重建
+```
+
+随后状态页自动经历（无需人工干预）：
+
+1. 续采前的**连续性证明**发现槽位 `confirmed_flush_lsn/restart_lsn` 已越过镜像
+   保存位置 `last_applied_lsn`，判定 WAL 覆盖断档；
+2. 立即出现红色横幅“已停止旧目录供数”，`/events`、`/events.csv` 返回 **503**，
+   旧的 3.0 被封存但不再发布；
+3. 状态自动转为 `loading`，丢弃旧镜像、重建复制槽并重新初始装载 + 追平；
+4. 追平完成后才解除停供闩锁恢复供数，此时查询 `EQH-000001` 得到 **8.8**。
+
+若重建过程中源库不可用或进程再次重启：`loading` 状态与停供原因随卷持久保留，
+应用只会重试重建，**不会**把旧值或半成品重新发布出去。
+
 
 ## 网页与接口
 
@@ -118,6 +147,7 @@ docker compose restart app
 | `POST /mirror/start` | 开始建立镜像（idle 时） |
 | `POST /mirror/rebuild` | 丢弃当前镜像重新建立 |
 | `POST /demo/crash-after-save` | 武装“保存后未确认就崩溃”演示 |
+| `POST /demo/slot-reset` | 同名换槽断档演示：EQ1 改 8.8 后删槽并同名重建，触发自动停供+重建 |
 | `GET /events` | 查询震例：震例号前缀、发震时刻区间、最小震级、经纬度范围、分页 |
 | `GET /events.csv` | 下载当前目录 CSV（支持同样筛选；整个文件出自同一已提交状态） |
 | `GET /verify` | 源库 vs 镜像全量比对（行数 + SHA-256 + 差异样例） |
@@ -139,18 +169,22 @@ docker compose restart app
 | --- | --- |
 | 初始装载中 | 状态 `loading` → 重做装载，就绪前不供数 |
 | 追平中 | 状态 `catchup` → 重做装载（快照已失效，必须重来），就绪前不供数 |
-| 已就绪 | 状态 `done` → 从槽位已确认位置续采，不重新装载 |
-| 保存后未确认就崩溃 | 源库重发未确认事务，镜像幂等重放，不重不漏 |
-| 复制槽被删（源库重置） | 自动转为重新建立镜像 |
+| 已就绪 | 状态 `done` 且连续性证明通过 → 从槽位已确认位置续采，不重新装载 |
+| 保存后未确认就崩溃 | 源库重发未确认事务，LSN 守卫跳过重复、仅补确认，不重不漏、目录不回退 |
+| 复制槽被删（源库重置） | 证明失败：立即停供（503），自动转重新建立镜像，追平后恢复 |
+| 同名换槽断档（删后同名重建） | 槽位 LSN 越过保存点即判定断档：停供旧目录并自动重建，旧值绝不继续发布 |
+| 重建失败 / 重建中再次重启 | `loading`+停供闩锁随卷保留，持续重试，期间不发布旧值与半成品 |
 | 卷被清空（`down -v`） | 一切从零开始，等待点击「开始建立镜像」 |
 
 ## 本地测试
 
-核心逻辑（SQLite 落库、wal2json 事务应用、LSN 换算、快照读一致性）有单元测试，
-无需 Docker：
+核心逻辑（SQLite 落库、wal2json 事务应用、LSN 换算、快照读一致性、
+复制槽连续性证明、同名换槽断档与正常续采的状态机恢复）有单元/回归测试，
+无需 Docker 与 PostgreSQL（用内存假实现顶替 psycopg2/walsender）：
 
 ```bash
-python3 -I tests/test_core.py
+python3 -I tests/test_core.py        # 核心落库/幂等/快照一致性（12 项）
+python3 -I tests/test_recovery.py    # 断档停供重建、正常续采、重发不回退等（17 项）
 ```
 
 ## 目录结构
@@ -160,9 +194,12 @@ compose.yaml            # 一键启动：db + app + simulator
 db/                     # PostgreSQL 16 + wal2json，含 3 万条历史震例的初始化脚本
 app/                    # FastAPI 网页 + 逻辑复制采集线程 + SQLite 镜像
   replicator.py         #   状态机：idle→loading→catchup→done，快照装载与流式续采
+  slotguard.py          #   复制槽连续性证明（同名换槽断档判定）+ LSN 守卫
   store.py              #   SQLite 层：数据与续采位置同事务持久化
   changes.py            #   wal2json 行变更 -> 幂等 upsert/delete
-  main.py               #   网页：状态 / 查询 / CSV / 校验
+  main.py               #   网页：状态 / 查询 / CSV / 校验 / 断档演示
 simulator/              # 源库扰动器：持续新增/更正/删除
 tests/test_core.py      # 核心逻辑单元测试
+tests/test_recovery.py  # 同名换槽断档 + 正常续采回归（含独立进程重启持久化）
+tests/_restart_worker.py# 回归用的子进程替身
 ```

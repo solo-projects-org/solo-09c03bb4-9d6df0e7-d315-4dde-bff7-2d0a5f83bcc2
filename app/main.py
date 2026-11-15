@@ -95,16 +95,30 @@ def page(title, body, refresh=False):
 
 
 def serving():
-    return store.get_meta("load_state", "idle") == "done"
+    """供数条件：状态 done 且没有停止供数闩锁。
+
+    serving_hold 在两种情况下置位：
+    1. 复制槽连续性无法证明（同名换槽断档/源库不可达）——旧目录立即停供；
+    2. 镜像（自动）重建期间——半成品不发布。
+    闩锁随 SQLite 持久化：进程再次重启后只要未完成新镜像，依旧 503。
+    """
+    if store.get_meta("load_state", "idle") != "done":
+        return False
+    return not store.get_meta("serving_hold", "")
 
 
 def not_ready():
     state = store.get_meta("load_state", "idle")
+    hold = store.get_meta("serving_hold", "")
+    reason = (
+        f"<p>停止供数原因：<b>{esc(hold)}</b></p>" if hold else
+        "<p class='muted'>按策略：镜像未建完（或重启后未建完需重做）时不提供查询与下载，"
+        "以免把不完整的目录交给重定位分析。</p>"
+    )
     body = (
         "<div class='card'><h2>镜像未就绪，暂不供数</h2>"
         f"<p>当前状态：<span class='badge b-{esc(state)}'>{esc(STATE_LABELS.get(state, state))}</span></p>"
-        "<p class='muted'>按策略：镜像未建完（或重启后未建完需重做）时不提供查询与下载，"
-        "以免把不完整的目录交给重定位分析。</p>"
+        f"{reason}"
         "<p><a class='btn' href='/'>返回采集状态</a></p></div>"
     )
     return HTMLResponse(page("镜像未就绪", body), status_code=503)
@@ -118,7 +132,7 @@ def collect_status():
     st = {
         "state": state,
         "state_label": STATE_LABELS.get(state, state),
-        "serving": state == "done",
+        "serving": state == "done" and not (meta.get("serving_hold") or ""),
         "loaded_rows": int(meta.get("loaded_rows") or 0),
         "applied_txns": int(meta.get("applied_txns") or 0),
         "applied_changes": int(meta.get("applied_changes") or 0),
@@ -126,6 +140,7 @@ def collect_status():
         "consistent_point": meta.get("consistent_point") or "",
         "target_lsn": meta.get("target_lsn") or "",
         "ready_at": meta.get("ready_at") or "",
+        "serving_hold": meta.get("serving_hold") or "",
         "mirror_rows": store.read("SELECT count(*) FROM events")[0][0],
         "crash_armed": replicator.crash_armed.is_set(),
         "source_ok": False,
@@ -141,6 +156,7 @@ def collect_status():
                 st["source_rows"] = cur.fetchone()[0]
                 cur.execute(
                     "SELECT slot_name, active, confirmed_flush_lsn::text, "
+                    "restart_lsn::text, "
                     "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint "
                     "FROM pg_replication_slots WHERE slot_name=%s",
                     (SLOT,),
@@ -151,7 +167,8 @@ def collect_status():
                         "name": row[0],
                         "active": bool(row[1]),
                         "confirmed_flush_lsn": row[2],
-                        "lag_bytes": int(row[3]),
+                        "restart_lsn": row[3],
+                        "lag_bytes": int(row[4]),
                     }
             st["source_ok"] = True
         finally:
@@ -192,6 +209,10 @@ def dashboard():
             f"<span class='mono'>{esc(slot['confirmed_flush_lsn'])}</span>",
         ))
         rows.append((
+            "槽位保留 WAL 起点 restart_lsn",
+            f"<span class='mono'>{esc(slot['restart_lsn'])}</span>",
+        ))
+        rows.append((
             "复制槽",
             f"<span class='mono'>{esc(slot['name'])}</span> · "
             f"{'活跃' if slot['active'] else '空闲'} · 待确认延迟 {slot['lag_bytes']} 字节",
@@ -204,15 +225,23 @@ def dashboard():
         rows.append(("追平目标 target_lsn", f"<span class='mono'>{esc(st['target_lsn'])}</span>"))
     if st["ready_at"]:
         rows.append(("就绪时间", esc(st["ready_at"])))
+    if st["serving_hold"]:
+        rows.append(("停止供数原因", f"<b>{esc(st['serving_hold'])}</b>"))
 
     table = "".join(f"<tr><th style='width:34%'>{k}</th><td>{v}</td></tr>" for k, v in rows)
 
     banner = ""
-    if st["unconfirmed_ahead"]:
+    if st["serving_hold"]:
+        banner = (
+            "<div class='err'>⛔ 已停止旧目录供数（查询/CSV 返回 503）："
+            f"{esc(st['serving_hold'])}。系统将自动重建镜像并追平后恢复供数；"
+            "重建失败或再次重启都不会发布旧值或半成品。</div>"
+        )
+    elif st["unconfirmed_ahead"]:
         banner = (
             "<div class='warn'>⚠ 镜像已保存的位置领先源库已确认的位置 —— 即"
             "「保存后尚未确认就重启」的现场：源库会把未确认的事务重发过来，"
-            "镜像端幂等重放，不重不漏。</div>"
+            "镜像端按 LSN 守卫幂等跳过，不重不漏、目录不回退。</div>"
         )
     if not st["source_ok"]:
         banner += f"<div class='err'>源库连接异常：{esc(st.get('source_error', ''))}</div>"
@@ -240,6 +269,11 @@ def dashboard():
                 "<form class='inline' method='post' action='/demo/crash-after-save'>"
                 "<button type='submit' class='danger'>模拟崩溃：保存后未确认</button></form>"
             )
+        actions.append(
+            "<form class='inline' method='post' action='/demo/slot-reset' "
+            "onsubmit='return confirm(\"将删除并同名重建复制槽（制造断档），应用应自动停供并重建镜像。继续？\")'>"
+            "<button type='submit' class='danger'>模拟同名换槽断档</button></form>"
+        )
         actions.append("<a class='btn' href='/events'>查询震例</a>")
         actions.append("<a class='btn' href='/events.csv'>下载当前目录 CSV</a>")
         actions.append("<a class='btn' href='/verify'>一致性校验</a>")
@@ -285,6 +319,51 @@ def crash_after_save():
     if serving():
         replicator.arm_crash_after_save()
         store.log("已武装崩溃演示：下一笔源事务写入镜像并持久化后，不向源库确认即退出进程")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/demo/slot-reset")
+def demo_slot_reset():
+    """复刻现场：停机期间复制槽被删、又用原槽名重建（同名换槽断档）。
+
+    步骤（源库侧一个连接内完成）：
+      1. 把 EQ1 震级改为 8.8（断档期间发生、新槽永远不会投递的变更）；
+      2. 终止占用槽位的 walsender，删除复制槽，再用同名重建 —— 新槽的
+         confirmed_flush_lsn/restart_lsn 从当前 WAL 起算，覆盖不到第 1 步；
+    应用侧在下一次续采核验时证明失败 => 立即停止旧目录供数并自动重建镜像，
+    重建完成后 EQ1 才能以 8.8 重新供数。
+    """
+    if not serving():
+        return RedirectResponse("/", status_code=303)
+    try:
+        conn = psycopg2.connect(connect_timeout=5, **PG)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE seismic_events SET magnitude=8.8 WHERE event_id='EQH-000001'"
+                )
+                cur.execute(
+                    "SELECT pg_terminate_backend(active_pid) "
+                    "FROM pg_replication_slots WHERE slot_name=%s AND active",
+                    (SLOT,),
+                )
+                cur.execute(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name=%s", (SLOT,)
+                )
+                if cur.fetchone():
+                    cur.execute("SELECT pg_drop_replication_slot(%s)", (SLOT,))
+                cur.execute(
+                    f"CREATE_REPLICATION_SLOT {SLOT} LOGICAL wal2json"
+                )
+        finally:
+            conn.close()
+        store.log(
+            "演示：源库已将 EQH-000001 震级改为 8.8，并删除后同名重建复制槽 "
+            f"{SLOT}（制造 WAL 断档）；等待应用续采核验失败后自动停供并重建"
+        )
+    except Exception as exc:  # 页面保持可用，把原因交给状态页横幅
+        store.log(f"同名换槽演示执行失败：{exc!r}")
     return RedirectResponse("/", status_code=303)
 
 
